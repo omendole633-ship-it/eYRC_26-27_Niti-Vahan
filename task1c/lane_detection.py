@@ -59,66 +59,106 @@ def detect_lane(frame):
     h, w = frame.shape[:2]
     vehicle_x = w // 2
 
-    # HSV thresholding
+    # HSV conversion & color masks
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    white = cv2.inRange(hsv, np.array([0, 0, 180], dtype=np.uint8), np.array([180, 45, 255], dtype=np.uint8))
-    yellow = cv2.inRange(hsv, np.array([15, 60, 100], dtype=np.uint8), np.array([35, 255, 255], dtype=np.uint8))
+    white = cv2.inRange(hsv, np.array([0, 0, 175], dtype=np.uint8), np.array([180, 50, 255], dtype=np.uint8))
+    yellow = cv2.inRange(hsv, np.array([14, 50, 90], dtype=np.uint8), np.array([36, 255, 255], dtype=np.uint8))
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 40, 130)
+
     combined = cv2.bitwise_or(cv2.bitwise_or(white, yellow), edges)
 
-    # Road surface ROI
-    poly = np.array([[(30, 470), (250, 260), (390, 260), (610, 470)]], dtype=np.int32)
+    # Perspective ROI focusing on the immediate drivable lane ahead
+    poly = np.array([[(20, 470), (220, 260), (420, 260), (620, 470)]], dtype=np.int32)
     roi = np.zeros_like(gray)
     cv2.fillPoly(roi, poly, 255)
     binary = cv2.bitwise_and(combined, roi)
 
-    lines = cv2.HoughLinesP(binary, 1, np.pi / 180, 25, minLineLength=30, maxLineGap=40)
-    eval_y = 440
-    candidates = []
+    lines = cv2.HoughLinesP(binary, 1, np.pi / 180, 20, minLineLength=25, maxLineGap=45)
+    eval_y = 430
+
+    left_lines = []
+    right_lines = []
+
     if lines is not None:
         for line in lines:
             for x1, y1, x2, y2 in line:
-                dx, dy = x2 - x1, y2 - y1
+                dx = x2 - x1
+                dy = y2 - y1
                 if dx == 0:
-                    candidates.append(int(x1))
-                elif abs(dy / dx) >= 0.3:
-                    candidates.append(int(x1 + (eval_y - y1) * dx / dy))
+                    x_at_eval = x1
+                    slope = 999.0
+                else:
+                    slope = dy / float(dx)
+                    if abs(slope) < 0.25:
+                        continue
+                    x_at_eval = int(x1 + (eval_y - y1) / slope)
 
-    left_x = [x for x in candidates if 0 <= x < vehicle_x]
-    right_x = [x for x in candidates if vehicle_x < x <= 640]
+                if -80 <= x_at_eval <= 720:
+                    if x_at_eval < vehicle_x:
+                        left_lines.append((x_at_eval, slope))
+                    else:
+                        right_lines.append((x_at_eval, slope))
 
-    lane = LANE_UNKNOWN
+    nominal_half_width = 155
     center_x = -1
+    lane = LANE_UNKNOWN
 
-    if left_x and right_x:
-        l, r = max(left_x), min(right_x)
-        w_lane = r - l
-        center_x = (l + r) // 2 if 160 < w_lane < 480 else (l + 160 if (vehicle_x - l) < (r - vehicle_x) else r - 160)
-        lane = LANE_LEFT if r < 560 else (LANE_RIGHT if l > 80 else LANE_UNKNOWN)
-    elif left_x:
-        center_x = max(left_x) + 160
+    # Filter out outlier line coordinates
+    valid_left = [x for x, s in left_lines if x > 10]
+    valid_right = [x for x, s in right_lines if x < 630]
+
+    best_left = max(valid_left) if valid_left else None
+    best_right = min(valid_right) if valid_right else None
+
+    if best_left is not None and best_right is not None:
+        measured_width = best_right - best_left
+        if 200 <= measured_width <= 440:
+            center_x = (best_left + best_right) // 2
+            # Lane assignment based on divider location
+            if center_x < 280:
+                lane = LANE_LEFT
+            elif center_x > 360:
+                lane = LANE_RIGHT
+            else:
+                # If centered in camera, distinguish by boundary distance from image edges
+                lane = LANE_RIGHT if best_left > 120 else LANE_LEFT
+        elif best_left > 140:
+            # Strong divider on left -> vehicle in right lane
+            center_x = best_left + nominal_half_width
+            lane = LANE_RIGHT
+        elif best_right < 500:
+            # Strong divider on right -> vehicle in left lane
+            center_x = best_right - nominal_half_width
+            lane = LANE_LEFT
+        else:
+            center_x = (best_left + best_right) // 2
+            lane = LANE_RIGHT if center_x >= vehicle_x else LANE_LEFT
+    elif best_left is not None:
+        center_x = best_left + nominal_half_width
         lane = LANE_RIGHT
-    elif right_x:
-        center_x = min(right_x) - 160
+    elif best_right is not None:
+        center_x = best_right - nominal_half_width
         lane = LANE_LEFT
 
     if center_x != -1 and lane != LANE_UNKNOWN:
+        center_x = int(max(40, min(600, center_x)))
         if _PREV_CENTER_X is not None:
-            center_x = int(0.7 * center_x + 0.3 * _PREV_CENTER_X)
+            center_x = int(0.75 * center_x + 0.25 * _PREV_CENTER_X)
         _PREV_CENTER_X = center_x
         _PREV_LANE = lane
         _FRAMES_LOST = 0
-    elif _PREV_CENTER_X is not None and _FRAMES_LOST < 6:
+    elif _PREV_CENTER_X is not None and _FRAMES_LOST < 8:
         center_x = _PREV_CENTER_X
         lane = _PREV_LANE
         _FRAMES_LOST += 1
     else:
-        center_x = -1
-        lane = LANE_UNKNOWN
+        center_x = 320
+        lane = _PREV_LANE if _PREV_LANE != LANE_UNKNOWN else LANE_RIGHT
 
-    return {"center_x": int(max(0, min(639, center_x))) if center_x != -1 else -1, "lane": lane}
+    return {"center_x": int(center_x), "lane": lane}
 
 ##############################################################
 ################ END OF YOUR IMPLEMENTATION ##################
