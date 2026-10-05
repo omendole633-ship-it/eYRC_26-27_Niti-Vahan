@@ -46,71 +46,79 @@ VALID_LANES = (LANE_LEFT, LANE_RIGHT, LANE_UNKNOWN)
 ############### ADD YOUR IMPLEMENTATION HERE #################
 ##############################################################
 
+# Team ID: 5974
+_PREV_CENTER_X = None
+_PREV_LANE = LANE_UNKNOWN
+_FRAMES_LOST = 0
+
 def detect_lane(frame):
-    '''
-    Purpose:
-    ---
-    Detect the lane in a single frame and report where the centre of the lane
-    is, and which of the two lanes the vehicle is currently in.
+    global _PREV_CENTER_X, _PREV_LANE, _FRAMES_LOST
+    if frame is None or frame.shape[0] != 480 or frame.shape[1] != 640:
+        return {"center_x": -1, "lane": LANE_UNKNOWN}
 
-    Input Arguments:
-    ---
-    `frame` :   [ numpy.ndarray ]
-        A single BGR frame read from the video, of shape (height, width, 3).
+    h, w = frame.shape[:2]
+    vehicle_x = w // 2
 
-    Returns:
-    ---
-    `result` :  [ dict ]
-        {
-            "center_x" : int,   x-pixel of the lane centre in this frame,
-                                or -1 if the lane could not be found
-            "lane"     : str,   "left", "right" or "unknown"
-        }
+    # HSV thresholding
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    white = cv2.inRange(hsv, np.array([0, 0, 180], dtype=np.uint8), np.array([180, 45, 255], dtype=np.uint8))
+    yellow = cv2.inRange(hsv, np.array([15, 60, 100], dtype=np.uint8), np.array([35, 255, 255], dtype=np.uint8))
 
-    Example call:
-    ---
-    result = detect_lane(frame)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
+    combined = cv2.bitwise_or(cv2.bitwise_or(white, yellow), edges)
 
-    COORDINATE SYSTEM:
-    ---
-    `center_x` is an absolute pixel column in the frame AS RECEIVED - the
-    dataset's own resolution, 640x480. It is compared against a ground truth
-    measured in those pixels, so it only means anything in them.
+    # Road surface ROI
+    poly = np.array([[(30, 470), (250, 260), (390, 260), (610, 470)]], dtype=np.int32)
+    roi = np.zeros_like(gray)
+    cv2.fillPoly(roi, poly, 255)
+    binary = cv2.bitwise_and(combined, roi)
 
-    You may resize, crop or warp all you like inside this function, but scale
-    the answer back before returning it. A centre found in a 320x240 copy is
-    half the value it should be, and a centre read off a bird's-eye view is in
-    warped coordinates, not frame ones - map the point back through the inverse
-    of your transform. Do not re-encode or resize the clip files themselves.
+    lines = cv2.HoughLinesP(binary, 1, np.pi / 180, 25, minLineLength=30, maxLineGap=40)
+    eval_y = 440
+    candidates = []
+    if lines is not None:
+        for line in lines:
+            for x1, y1, x2, y2 in line:
+                dx, dy = x2 - x1, y2 - y1
+                if dx == 0:
+                    candidates.append(int(x1))
+                elif abs(dy / dx) >= 0.3:
+                    candidates.append(int(x1 + (eval_y - y1) * dx / dy))
 
-    NOTE:
-    ---
-    This function must ONLY compute and return the result.
-    Do not call cv2.imshow(), cv2.waitKey(), cv2.imwrite() or print() from
-    inside it. All visualisation and debugging output belongs outside this
-    function - see draw_overlay() and process_video() below.
-    '''
+    left_x = [x for x in candidates if 0 <= x < vehicle_x]
+    right_x = [x for x in candidates if vehicle_x < x <= 640]
 
-    center_x = -1
     lane = LANE_UNKNOWN
+    center_x = -1
 
-    #################### ADD YOUR CODE HERE ####################
-    # 1. Isolate the lane markings in `frame`
-    # 2. Work out which two markings bracket the vehicle
-    # 3. Compute the x-pixel of the lane centre   ->  center_x
-    # 4. Decide which lane the vehicle is in      ->  lane
-    ############################################################
+    if left_x and right_x:
+        l, r = max(left_x), min(right_x)
+        w_lane = r - l
+        center_x = (l + r) // 2 if 160 < w_lane < 480 else (l + 160 if (vehicle_x - l) < (r - vehicle_x) else r - 160)
+        lane = LANE_LEFT if r < 560 else (LANE_RIGHT if l > 80 else LANE_UNKNOWN)
+    elif left_x:
+        center_x = max(left_x) + 160
+        lane = LANE_RIGHT
+    elif right_x:
+        center_x = min(right_x) - 160
+        lane = LANE_LEFT
 
-    return {"center_x": center_x, "lane": lane}
+    if center_x != -1 and lane != LANE_UNKNOWN:
+        if _PREV_CENTER_X is not None:
+            center_x = int(0.7 * center_x + 0.3 * _PREV_CENTER_X)
+        _PREV_CENTER_X = center_x
+        _PREV_LANE = lane
+        _FRAMES_LOST = 0
+    elif _PREV_CENTER_X is not None and _FRAMES_LOST < 6:
+        center_x = _PREV_CENTER_X
+        lane = _PREV_LANE
+        _FRAMES_LOST += 1
+    else:
+        center_x = -1
+        lane = LANE_UNKNOWN
 
-
-# ------------------------------------------------------------------
-# Add any helper functions and global variables you need below this
-# comment, and keep them ABOVE the "END OF YOUR IMPLEMENTATION" line.
-# They must be called from detect_lane() - the evaluation script only
-# ever calls that one function. List them in the file header too.
-# ------------------------------------------------------------------
-
+    return {"center_x": int(max(0, min(639, center_x))) if center_x != -1 else -1, "lane": lane}
 
 ##############################################################
 ################ END OF YOUR IMPLEMENTATION ##################
